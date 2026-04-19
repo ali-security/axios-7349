@@ -18,7 +18,8 @@ module.exports = function(grunt) {
             'es5',
             'es2015.promise',
             'dom'
-          ]
+          ],
+          types: []
         },
         src: ['typings/index.d.ts', 'test/typescript/*.ts']
       }
