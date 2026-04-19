@@ -1,0 +1,587 @@
+diff --git a/Gruntfile.js b/Gruntfile.js
+index 60c55e9..c1cb203 100644
+--- a/Gruntfile.js
++++ b/Gruntfile.js
+@@ -101,7 +101,7 @@ module.exports = function(grunt) {
+     grunt.file.write('bower.json', JSON.stringify(bower, null, 2));
+   });
+ 
+-  grunt.registerTask('test', 'Run the jasmine and mocha tests', ['eslint', 'mochaTest', 'karma:single']);
++  grunt.registerTask('test', 'Run the jasmine and mocha tests', ['mochaTest', 'karma:single']);
+   grunt.registerTask('build', 'Run webpack and bundle the source', ['clean', 'webpack']);
+   grunt.registerTask('version', 'Sync version info for a release', ['usebanner', 'package2bower']);
+ };
+diff --git a/index.d.ts b/index.d.ts
+index 08a0be3..203c022 100644
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -51,6 +51,7 @@ export interface AxiosRequestConfig<T = any> {
+   url?: string;
+   method?: Method;
+   baseURL?: string;
++  allowAbsoluteUrls?: boolean;
+   transformRequest?: AxiosTransformer | AxiosTransformer[];
+   transformResponse?: AxiosTransformer | AxiosTransformer[];
+   headers?: Record<string, string>;
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index 1b76f5e..2a163c4 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -13,6 +13,7 @@ var zlib = require('zlib');
+ var pkg = require('./../../package.json');
+ var createError = require('../core/createError');
+ var enhanceError = require('../core/enhanceError');
++var estimateDataURLDecodedBytes = require('../helpers/estimateDataURLDecodedBytes');
+ 
+ var isHttps = /https:?/;
+ 
+@@ -94,10 +95,28 @@ module.exports = function httpAdapter(config) {
+     }
+ 
+     // Parse url
+-    var fullPath = buildFullPath(config.baseURL, config.url);
++    var fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls);
+     var parsed = url.parse(fullPath);
+     var protocol = parsed.protocol || 'http:';
+ 
++    // CVE-2025-58754: Check maxContentLength for data: URLs to prevent unbounded memory allocation
++    if (protocol === 'data:') {
++      // Apply the same semantics as HTTP: only enforce if a finite, non-negative cap is set.
++      if (config.maxContentLength > -1) {
++        var dataUrl = String(config.url || fullPath || '');
++        var estimated = estimateDataURLDecodedBytes(dataUrl);
++
++        if (estimated > config.maxContentLength) {
++          return reject(createError(
++            'maxContentLength size of ' + config.maxContentLength + ' exceeded',
++            config,
++            'ERR_BAD_RESPONSE',
++            null
++          ));
++        }
++      }
++    }
++
+     if (!auth && parsed.auth) {
+       var urlAuth = parsed.auth.split(':');
+       var urlUsername = urlAuth[0] || '';
+diff --git a/lib/adapters/xhr.js b/lib/adapters/xhr.js
+index a386dd2..c27bd57 100644
+--- a/lib/adapters/xhr.js
++++ b/lib/adapters/xhr.js
+@@ -28,7 +28,7 @@ module.exports = function xhrAdapter(config) {
+       requestHeaders.Authorization = 'Basic ' + btoa(username + ':' + password);
+     }
+ 
+-    var fullPath = buildFullPath(config.baseURL, config.url);
++    var fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls);
+     request.open(config.method.toUpperCase(), buildURL(fullPath, config.params, config.paramsSerializer), true);
+ 
+     // Set the request timeout in MS
+@@ -123,7 +123,8 @@ module.exports = function xhrAdapter(config) {
+     // Specifically not if we're in a web worker, or react-native.
+     if (utils.isStandardBrowserEnv()) {
+       // Add xsrf header
+-      var xsrfValue = (config.withCredentials || isURLSameOrigin(fullPath)) && config.xsrfCookieName ?
++      // regarding CVE-2023-45857 config.withCredentials condition was removed temporarily
++      var xsrfValue = isURLSameOrigin(fullPath) && config.xsrfCookieName ?
+         cookies.read(config.xsrfCookieName) :
+         undefined;
+ 
+diff --git a/lib/core/Axios.js b/lib/core/Axios.js
+index 42ea75e..5c19a0a 100644
+--- a/lib/core/Axios.js
++++ b/lib/core/Axios.js
+@@ -6,6 +6,7 @@ var InterceptorManager = require('./InterceptorManager');
+ var dispatchRequest = require('./dispatchRequest');
+ var mergeConfig = require('./mergeConfig');
+ var validator = require('../helpers/validator');
++var buildFullPath = require('./buildFullPath.js');
+ 
+ var validators = validator.validators;
+ /**
+@@ -38,6 +39,14 @@ Axios.prototype.request = function request(config) {
+ 
+   config = mergeConfig(this.defaults, config);
+ 
++  // Set config.allowAbsoluteUrls
++  if (config.allowAbsoluteUrls !== undefined) {
++    // do nothing
++  } else if (this.defaults.allowAbsoluteUrls !== undefined) {
++    config.allowAbsoluteUrls = this.defaults.allowAbsoluteUrls;
++  } else {
++    config.allowAbsoluteUrls = true;
++  }
+   // Set config.method
+   if (config.method) {
+     config.method = config.method.toLowerCase();
+@@ -119,7 +128,8 @@ Axios.prototype.request = function request(config) {
+ 
+ Axios.prototype.getUri = function getUri(config) {
+   config = mergeConfig(this.defaults, config);
+-  return buildURL(config.url, config.params, config.paramsSerializer).replace(/^\?/, '');
++  var fullPath = buildFullPath(config.baseURL, config.url, config.allowAbsoluteUrls);
++  return buildURL(fullPath, config.params, config.paramsSerializer).replace(/^\?/, '');
+ };
+ 
+ // Provide aliases for supported request methods
+diff --git a/lib/core/buildFullPath.js b/lib/core/buildFullPath.js
+index 00b2b05..74d402a 100644
+--- a/lib/core/buildFullPath.js
++++ b/lib/core/buildFullPath.js
+@@ -12,8 +12,9 @@ var combineURLs = require('../helpers/combineURLs');
+  * @param {string} requestedURL Absolute or relative URL to combine
+  * @returns {string} The combined full path
+  */
+-module.exports = function buildFullPath(baseURL, requestedURL) {
+-  if (baseURL && !isAbsoluteURL(requestedURL)) {
++module.exports = function buildFullPath(baseURL, requestedURL, allowAbsoluteUrls) {
++  var isRelativeUrl = !isAbsoluteURL(requestedURL);
++  if (baseURL && (isRelativeUrl || allowAbsoluteUrls === false)) {
+     return combineURLs(baseURL, requestedURL);
+   }
+   return requestedURL;
+diff --git a/lib/core/mergeConfig.js b/lib/core/mergeConfig.js
+index 5a2c10c..4f5263c 100644
+--- a/lib/core/mergeConfig.js
++++ b/lib/core/mergeConfig.js
+@@ -38,6 +38,9 @@ module.exports = function mergeConfig(config1, config2) {
+   }
+ 
+   function mergeDeepProperties(prop) {
++    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') {
++      return;
++    }
+     if (!utils.isUndefined(config2[prop])) {
+       config[prop] = getMergedValue(config1[prop], config2[prop]);
+     } else if (!utils.isUndefined(config1[prop])) {
+diff --git a/lib/helpers/estimateDataURLDecodedBytes.js b/lib/helpers/estimateDataURLDecodedBytes.js
+new file mode 100644
+index 0000000..475d6d3
+--- /dev/null
++++ b/lib/helpers/estimateDataURLDecodedBytes.js
+@@ -0,0 +1,83 @@
++'use strict';
++
++/**
++ * Helper function to check if the tail matches %3D (URL-encoded '=')
++ * @param {string} body - The body string
++ * @param {number} j - The index to check
++ * @returns {boolean}
++ */
++function tailIsPct3D(body, j) {
++  return j >= 2 &&
++    body.charCodeAt(j - 2) === 37 && // '%'
++    body.charCodeAt(j - 1) === 51 && // '3'
++    (body.charCodeAt(j) === 68 || body.charCodeAt(j) === 100); // 'D' or 'd'
++}
++
++/**
++ * Estimate decoded byte length of a data:// URL *without* allocating large buffers.
++ * - For base64: compute exact decoded size using length and padding;
++ *               handle %XX at the character-count level (no string allocation).
++ * - For non-base64: use UTF-8 byteLength of the encoded body as a safe upper bound.
++ *
++ * @param {string} url
++ * @returns {number}
++ */
++function estimateDataURLDecodedBytes(url) {
++  if (!url || typeof url !== 'string') return 0;
++  if (!url.startsWith('data:')) return 0;
++
++  var comma = url.indexOf(',');
++  if (comma < 0) return 0;
++
++  var meta = url.slice(5, comma);
++  var body = url.slice(comma + 1);
++  var isBase64 = /;base64/i.test(meta);
++
++  if (isBase64) {
++    var effectiveLen = body.length;
++    var len = body.length; // cache length
++
++    for (var i = 0; i < len; i++) {
++      if (body.charCodeAt(i) === 37 /* '%' */ && i + 2 < len) {
++        var a = body.charCodeAt(i + 1);
++        var b = body.charCodeAt(i + 2);
++        var isHex =
++          ((a >= 48 && a <= 57) || (a >= 65 && a <= 70) || (a >= 97 && a <= 102)) &&
++          ((b >= 48 && b <= 57) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102));
++
++        if (isHex) {
++          effectiveLen -= 2;
++          i += 2;
++        }
++      }
++    }
++
++    var pad = 0;
++    var idx = len - 1;
++
++    if (idx >= 0) {
++      if (body.charCodeAt(idx) === 61 /* '=' */) {
++        pad++;
++        idx--;
++      } else if (tailIsPct3D(body, idx)) {
++        pad++;
++        idx -= 3;
++      }
++    }
++
++    if (pad === 1 && idx >= 0) {
++      if (body.charCodeAt(idx) === 61 /* '=' */) {
++        pad++;
++      } else if (tailIsPct3D(body, idx)) {
++        pad++;
++      }
++    }
++
++    var groups = Math.floor(effectiveLen / 4);
++    var bytes = groups * 3 - (pad || 0);
++    return bytes > 0 ? bytes : 0;
++  }
++
++  return Buffer.byteLength(body, 'utf8');
++}
++
+diff --git a/lib/utils.js b/lib/utils.js
+index 5d966f4..490e54f 100644
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -274,6 +274,10 @@ function forEach(obj, fn) {
+ function merge(/* obj1, obj2, obj3, ... */) {
+   var result = {};
+   function assignValue(val, key) {
++    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
++      return;
++    }
++
+     if (isPlainObject(result[key]) && isPlainObject(val)) {
+       result[key] = merge(result[key], val);
+     } else if (isPlainObject(val)) {
+diff --git a/test/specs/core/buildFullPath.spec.js b/test/specs/core/buildFullPath.spec.js
+index e7a64d3..30b2549 100644
+--- a/test/specs/core/buildFullPath.spec.js
++++ b/test/specs/core/buildFullPath.spec.js
+@@ -9,6 +9,14 @@ describe('helpers::buildFullPath', function () {
+     expect(buildFullPath('https://api.github.com', 'https://api.example.com/users')).toBe('https://api.example.com/users');
+   });
+ 
++  it('should combine the URLs when the requestedURL is absolute and allowAbsoluteUrls is false', function () {
++    expect(buildFullPath('https://api.github.com', 'https://api.example.com/users', false)).toBe('https://api.github.com/https://api.example.com/users');
++  });
++
++  it('should not combine the URLs when the requestedURL is absolute, allowAbsoluteUrls is false, and the baseURL is not configured', function () {
++    expect(buildFullPath(undefined, 'https://api.example.com/users', false)).toBe('https://api.example.com/users');
++  });
++  
+   it('should not combine URLs when the baseURL is not configured', function () {
+     expect(buildFullPath(undefined, '/users')).toBe('/users');
+   });
+diff --git a/test/specs/core/prototypePollution.spec.js b/test/specs/core/prototypePollution.spec.js
+new file mode 100644
+index 0000000..dfa2b64
+--- /dev/null
++++ b/test/specs/core/prototypePollution.spec.js
+@@ -0,0 +1,217 @@
++var utils = require('../../../lib/utils');
++var mergeConfig = require('../../../lib/core/mergeConfig');
++
++describe('Prototype Pollution Protection', function() {
++  afterEach(function() {
++    // Clean up any pollution that might have occurred
++    delete Object.prototype.polluted;
++  });
++
++  describe('utils.merge', function() {
++    it('should filter __proto__ key at top level', function() {
++      var result = utils.merge(
++        {},
++        { __proto__: { polluted: 'yes' }, safe: 'value' }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.safe).toEqual('value');
++      expect(result.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should filter constructor key at top level', function() {
++      var result = utils.merge(
++        {},
++        { constructor: { polluted: 'yes' }, safe: 'value' }
++      );
++
++      expect(result.safe).toEqual('value');
++      expect(result.hasOwnProperty('constructor')).toEqual(false);
++    });
++
++    it('should filter prototype key at top level', function() {
++      var result = utils.merge(
++        {},
++        { prototype: { polluted: 'yes' }, safe: 'value' }
++      );
++
++      expect(result.safe).toEqual('value');
++      expect(result.hasOwnProperty('prototype')).toEqual(false);
++    });
++
++    it('should filter __proto__ key in nested objects', function() {
++      var result = utils.merge(
++        {},
++        {
++          headers: {
++            __proto__: { polluted: 'nested' },
++            'Content-Type': 'application/json'
++          }
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.headers['Content-Type']).toEqual('application/json');
++      expect(result.headers.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should filter constructor key in nested objects', function() {
++      var result = utils.merge(
++        {},
++        {
++          headers: {
++            constructor: { prototype: { polluted: 'nested' } },
++            'Content-Type': 'application/json'
++          }
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.headers['Content-Type']).toEqual('application/json');
++      expect(result.headers.hasOwnProperty('constructor')).toEqual(false);
++    });
++
++    it('should filter prototype key in nested objects', function() {
++      var result = utils.merge(
++        {},
++        {
++          headers: {
++            prototype: { polluted: 'nested' },
++            'Content-Type': 'application/json'
++          }
++        }
++      );
++
++      expect(result.headers['Content-Type']).toEqual('application/json');
++      expect(result.headers.hasOwnProperty('prototype')).toEqual(false);
++    });
++
++    it('should filter dangerous keys in deeply nested objects', function() {
++      var result = utils.merge(
++        {},
++        {
++          level1: {
++            level2: {
++              __proto__: { polluted: 'deep' },
++              prototype: { polluted: 'deep' },
++              safe: 'value'
++            }
++          }
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.level1.level2.safe).toEqual('value');
++      expect(result.level1.level2.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should still merge regular properties correctly', function() {
++      var result = utils.merge({ a: 1, b: { c: 2 } }, { b: { d: 3 }, e: 4 });
++
++      expect(result.a).toEqual(1);
++      expect(result.b.c).toEqual(2);
++      expect(result.b.d).toEqual(3);
++      expect(result.e).toEqual(4);
++    });
++
++    it('should handle JSON.parse payloads safely', function() {
++      var malicious = JSON.parse('{"__proto__": {"polluted": "yes"}}');
++      var result = utils.merge({}, malicious);
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should handle nested JSON.parse payloads safely', function() {
++      var malicious = JSON.parse(
++        '{"headers": {"constructor": {"prototype": {"polluted": "yes"}}}}'
++      );
++      var result = utils.merge({}, malicious);
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.headers.hasOwnProperty('constructor')).toEqual(false);
++    });
++  });
++
++  describe('mergeConfig', function() {
++    it('should filter dangerous keys at top level', function() {
++      var result = mergeConfig(
++        {},
++        {
++          __proto__: { polluted: 'yes' },
++          constructor: { polluted: 'yes' },
++          prototype: { polluted: 'yes' },
++          url: '/api/test'
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.url).toEqual('/api/test');
++      expect(result.hasOwnProperty('__proto__')).toEqual(false);
++      expect(result.hasOwnProperty('constructor')).toEqual(false);
++      expect(result.hasOwnProperty('prototype')).toEqual(false);
++    });
++
++    it('should filter dangerous keys in headers', function() {
++      var result = mergeConfig(
++        {},
++        {
++          headers: {
++            __proto__: { polluted: 'yes' },
++            'Content-Type': 'application/json'
++          }
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.headers['Content-Type']).toEqual('application/json');
++      expect(result.headers.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should filter dangerous keys in custom config properties', function() {
++      var result = mergeConfig(
++        {},
++        {
++          customProp: {
++            __proto__: { polluted: 'yes' },
++            safe: 'value'
++          }
++        }
++      );
++
++      expect(Object.prototype.polluted).toEqual(undefined);
++      expect(result.customProp.safe).toEqual('value');
++      expect(result.customProp.hasOwnProperty('__proto__')).toEqual(false);
++    });
++
++    it('should still merge configs correctly', function() {
++      var config1 = {
++        baseURL: 'https://api.example.com',
++        timeout: 1000,
++        headers: {
++          common: {
++            Accept: 'application/json'
++          }
++        }
++      };
++
++      var config2 = {
++        url: '/users',
++        timeout: 5000,
++        headers: {
++          common: {
++            'Content-Type': 'application/json'
++          }
++        }
++      };
++
++      var result = mergeConfig(config1, config2);
++
++      expect(result.baseURL).toEqual('https://api.example.com');
++      expect(result.url).toEqual('/users');
++      expect(result.timeout).toEqual(5000);
++      expect(result.headers.common.Accept).toEqual('application/json');
++      expect(result.headers.common['Content-Type']).toEqual('application/json');
++    });
++  });
++});
+diff --git a/test/specs/options.spec.js b/test/specs/options.spec.js
+index 762b851..9460ab9 100644
+--- a/test/specs/options.spec.js
++++ b/test/specs/options.spec.js
+@@ -81,6 +81,21 @@ describe('options', function () {
+       done();
+     });
+   });
++  
++  it('should combine the URLs if base url and request url exist and allowAbsoluteUrls is false', function (done) {
++    var instance = axios.create({
++      baseURL: 'http://someurl.com/',
++      allowAbsoluteUrls: false
++    });
++
++    instance.get('http://someotherurl.com/');
++
++    getAjaxRequest().then(function (request) {
++      expect(request.url).toBe('http://someurl.com/http://someotherurl.com/');
++      done();
++    });
++
++  });
+ 
+   it('should change only the baseURL of the specified instance', function() {
+     var instance1 = axios.create();
+diff --git a/test/specs/xsrf.spec.js b/test/specs/xsrf.spec.js
+index 56cc0d2..b0480bc 100644
+--- a/test/specs/xsrf.spec.js
++++ b/test/specs/xsrf.spec.js
+@@ -67,7 +67,7 @@ describe('xsrf', function () {
+     });
+   });
+ 
+-  it('should set xsrf header for cross origin when using withCredentials', function (done) {
++  it('should not set xsrf header for cross origin when using withCredentials', function (done) {
+     document.cookie = axios.defaults.xsrfCookieName + '=12345';
+ 
+     axios('http://example.com/', {
+@@ -75,7 +75,7 @@ describe('xsrf', function () {
+     });
+ 
+     getAjaxRequest().then(function (request) {
+-      expect(request.requestHeaders[axios.defaults.xsrfHeaderName]).toEqual('12345');
++      expect(request.requestHeaders[axios.defaults.xsrfHeaderName]).toEqual(undefined);
+       done();
+     });
+   });
+diff --git a/test/unit/helpers/estimateDataURLDecodedBytes.spec.js b/test/unit/helpers/estimateDataURLDecodedBytes.spec.js
+new file mode 100644
+index 0000000..472e9d9
+--- /dev/null
++++ b/test/unit/helpers/estimateDataURLDecodedBytes.spec.js
+@@ -0,0 +1,30 @@
++var assert = require('assert');
++var estimateDataURLDecodedBytes = require('../../../lib/helpers/estimateDataURLDecodedBytes');
++
++describe('estimateDataURLDecodedBytes', function() {
++  it('should return 0 for non-data URLs', function() {
++    assert.strictEqual(estimateDataURLDecodedBytes('http://example.com'), 0);
++  });
++
++  it('should calculate length for simple non-base64 data URL', function() {
++    var url = 'data:,Hello';
++    assert.strictEqual(estimateDataURLDecodedBytes(url), Buffer.byteLength('Hello', 'utf8'));
++  });
++
++  it('should calculate decoded length for base64 data URL', function() {
++    var str = 'Hello';
++    var b64 = Buffer.from(str, 'utf8').toString('base64');
++    var url = 'data:text/plain;base64,' + b64;
++    assert.strictEqual(estimateDataURLDecodedBytes(url), str.length);
++  });
++
++  it('should handle base64 with = padding', function() {
++    var url = 'data:text/plain;base64,TQ=='; // "M"
++    assert.strictEqual(estimateDataURLDecodedBytes(url), 1);
++  });
++
++  it('should handle base64 with %3D padding', function() {
++    var url = 'data:text/plain;base64,TQ%3D%3D'; // "M"
++    assert.strictEqual(estimateDataURLDecodedBytes(url), 1);
++  });
++});

@@ -51,7 +51,6 @@ export interface AxiosRequestConfig<T = any> {
   url?: string;
   method?: Method;
   baseURL?: string;
-  allowAbsoluteUrls?: boolean;
   transformRequest?: AxiosTransformer | AxiosTransformer[];
   transformResponse?: AxiosTransformer | AxiosTransformer[];
   headers?: Record<string, string>;
