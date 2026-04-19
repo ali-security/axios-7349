@@ -22,3 +22,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm install
       - run: npm test
+      - run: npm pack
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: axios-0.21.4-node-${{ matrix.node-version }}
+          path: axios-0.21.4.tgz
+          retention-days: 1
